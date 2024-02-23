@@ -6,21 +6,18 @@ import lpips
 
 
 class FirstStageLoss(nn.Module):
-    def __init__(self, mse_weight=1.0, vq_weight=0.1, adv_weight=0.1, perc_weight=0.1, start_disc=0, device="cpu"):
+    def __init__(self, mse_weight=1.0, adv_weight=0.1, perc_weight=0.1, start_disc=0, device="cpu"):
         super(FirstStageLoss, self).__init__()
         self.mse_weight = mse_weight
-        self.vq_weight = vq_weight
         self.adv_weight = adv_weight
         self.perc_weight = perc_weight
         self.start_disc = start_disc
         self.discriminator = Discriminator().to(device)
         self.lpips = lpips.LPIPS(net="vgg").to(device).requires_grad_(False)
 
-    def forward(self, images, videos, reconstructions, vq_loss, step):
-        if videos is not None:
-            videos = torch.cat([images.unsqueeze(1), videos], dim=1).view(-1, *videos.shape[2:])
-        else:
-            videos = images
+    def forward(self, images, reconstructions, step):
+
+        videos = images[0]
         reconstructions = reconstructions.contiguous().view(-1, *reconstructions.shape[2:])
         mse_loss = F.mse_loss(videos, reconstructions)
         if step >= self.start_disc:
@@ -34,9 +31,9 @@ class FirstStageLoss(nn.Module):
         else:
             g_loss = reconstructions.new_tensor(0)
             d_loss = None
-        lpips_loss = self.lpips(videos, reconstructions).mean()
+        #lpips_loss = self.lpips(videos, reconstructions).mean()
 
-        loss = self.mse_weight * mse_loss + self.adv_weight * g_loss + self.perc_weight * lpips_loss + self.vq_weight * vq_loss
+        loss = self.mse_weight * mse_loss + self.adv_weight * g_loss #+ self.perc_weight * lpips_loss #+ self.vq_weight * vq_loss
 
         return loss, d_loss
 

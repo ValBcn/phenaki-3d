@@ -10,10 +10,48 @@ from tqdm import tqdm
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import Dataset, DataLoader
 from loss.loss import FirstStageLoss
 from cvivit import VIVIT
+from cvivit3D import VIVIT3D
 from vivq import VIVQ
 from utils import get_dataloader
+import random
+
+class LUNA_Dataset(Dataset):
+     def __init__(
+         self,
+         img_folder,
+         length = 100
+
+     ):
+         super().__init__()
+         self.len = length
+         self.img_folder = img_folder
+
+     def __len__(self):
+         return self.len
+
+     def __getitem__(self, idx):
+
+         nodule = []
+         while np.asarray(nodule).size == 0:
+             rand_idx = random.randint(0,len(os.listdir(self.img_folder)))
+             file = os.path.join(self.img_folder, os.listdir(self.img_folder)[rand_idx])
+             img = np.load(file)["vol"]
+             nodule = np.load(file)["nodules"]
+
+         # print(img.shape)
+         # print(nodule)
+         nodule = nodule[0]
+         image = img[nodule[0]-8:nodule[0]+8,nodule[1]-32:nodule[1]+32,nodule[2]-32:nodule[2]+32]
+         image = torch.tensor(image[None,None,...], dtype=torch.float32)
+         
+         image2 = torch.tensor(np.zeros((1,1,16,64,64)), dtype=torch.float32)
+         image2[:,:,:image.shape[2],:image.shape[3],:image.shape[4]] = image
+         
+         caption = 'lungs nodule'
+         return image2
 
 
 def train(proc_id, args):
@@ -41,6 +79,9 @@ def train(proc_id, args):
 
     if args.model == "vivit":
         model = VIVIT(latent_size=16, compressed_frames=5, patch_size=(2, 8, 8), codebook_size=args.codebook_size).to(device)
+    if args.model == "vivit3d":
+        model = VIVIT3D(latent_size=64, patch_size=(2, 8, 8), codebook_size=args.codebook_size).to(device)
+
     elif args.model == "vivq":
         model = VIVQ(codebook_size=args.codebook_size).to(device)
     else:
@@ -51,7 +92,8 @@ def train(proc_id, args):
 
     criterion = FirstStageLoss(device=device)
     lr = 3e-4
-    dataset = get_dataloader(args)
+    #dataset = get_dataloader(args)
+    dataset = LUNA_Dataset(img_folder="/data/datasets/LUNA/npz/")
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     optimizer_discriminator = optim.AdamW(criterion.discriminator.parameters(), lr=lr*1e-2)
 
@@ -90,19 +132,19 @@ def train(proc_id, args):
     model.train()
     # images = torch.randn(1, 3, 128, 128)
     # videos = torch.randn(1, 10, 3, 128, 128)
-    # images, videos = next(iter(dataset))
+    images = next(iter(dataset))
+    # print("IMAGE shape :", images.shape)
+    # while images.shape != (1,1,16,64,64):
+    #     images = next(iter(dataset))
+    #     print("IMAGE shape :", images.shape)
+
     pbar = tqdm(enumerate(dataset, start=start_step), total=args.total_steps, initial=start_step) if args.node_id == 0 and proc_id == 0 else enumerate(dataset, start=start_step)
     # pbar = tqdm(range(1000000))
-    for step, (images, videos) in pbar:
+    for step, images in pbar:
     # for step in pbar:
         images = images.to(device)
-        if np.random.random() < 0.2:
-            videos = None
-        else:
-            videos = videos.to(device)
-
-        recon, vq_loss = model(images, videos)
-        loss, d_loss = criterion(images, videos, recon, vq_loss, step)
+        recon = model(images)
+        loss, d_loss = criterion(images, recon, step)
         loss_adjusted = loss / grad_accum_steps
         d_loss_adjusted = d_loss / grad_accum_steps
 
@@ -128,19 +170,19 @@ def train(proc_id, args):
             # })
 
         if args.node_id == 0 and proc_id == 0 and step % args.log_period == 0:
-            if videos is not None:
-                orig = torch.cat([images.unsqueeze(1), videos], dim=1)
-                orig = orig[0]
-            else:
-                orig = images
-            recon = recon[0]
-            comp = vutils.make_grid(torch.cat([orig, recon]), nrow=len(orig)).detach().cpu()
+
+            orig = images
+            # recon = recon[0]
+            
+            print("orig :", orig.shape)
+            print("recon :", recon.shape)
+            comp = vutils.make_grid(torch.cat([orig[:,:,orig.shape[2]//2,...], recon[:,:,orig.shape[2]//2,...]])).detach().cpu()
             # plt.imshow(comp.permute(1, 2, 0))
             # plt.show()
             vutils.save_image(comp, f"results/{args.run_name}/{step}.jpg")
 
             if step % args.extra_ckpt == 0:
-                torch.save(model.module.state_dict(), f"models/{args.run_name}/model_{step}.pt")
+                torch.save(model.state_dict(), f"models/{args.run_name}/model_{step}.pt")
                 torch.save(optimizer.state_dict(), f"models/{args.run_name}/model_{step}_optim.pt")
             torch.save(model.state_dict(), f"models/{args.run_name}/model.pt")
             torch.save(optimizer.state_dict(), f"models/{args.run_name}/optim.pt")
@@ -162,7 +204,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     args = parser.parse_args()
     args.run_name = "vivq_8192_drop_video"
-    args.model = "vivq"
+    args.model = "vivit3d"
     args.dataset = "first_stage"
     # args.dataset_path = "file:./data/6.tar"
     args.dataset_path = "/fsx/mas/phenaki/data/raw_data/Moments_in_Time_Raw/tar_files/{0..363}.tar"
@@ -178,9 +220,9 @@ if __name__ == '__main__':
     args.skip_frames = 5
 
     args.n_nodes = 1
-    args.node_id = int(os.environ["SLURM_PROCID"])
-    # args.node_id = 0
-    args.devices = [0, 1, 2, 3, 4, 5, 6, 7]
+    #args.node_id = int(os.environ["SLURM_PROCID"])
+    args.node_id = 0
+    args.devices = [0]
     # args.devices = [0]
 
     print("Launching with args: ", args)
